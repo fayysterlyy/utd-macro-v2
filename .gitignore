@@ -1,0 +1,5 @@
+# Only the release script and README are tracked in this repo.
+*
+!.gitignore
+!README.md
+!utdV2.luau
