@@ -1462,7 +1462,6 @@ STATE.onCleanup(function()
 end)
 
 local Tabs = {
-	Main = Window:AddTab("Main"),
 	Automation = Window:AddTab("Automation"),
 	["Auto Match"] = Window:AddTab("Auto Match"),
 	["Auto Fish"] = Window:AddTab("Auto Fish"),
@@ -1828,22 +1827,6 @@ DungeonBox:AddToggle("DungeonAutoClaim", {
 	end,
 })
 
---// Main tab
-local AutoBox = Tabs.Main:AddLeftGroupbox("Auto")
-
-AutoBox:AddToggle("AutoWave", {
-	Text = "Auto Next Wave",
-	Default = false,
-})
-
-AutoBox:AddToggle("AutoUpgrade", {
-	Text = "Auto Upgrade Towers",
-	Default = false,
-})
-
-AutoBox:AddDivider()
-AutoBox:AddLabel("Features pending - waiting for orders", true)
-
 --// Autofish: fires PlayerCatchFish every 1s while the toggle is on
 local fishRun = 0
 local AutofishBox = Tabs["Auto Fish"]:AddLeftGroupbox("Autofish")
@@ -1881,11 +1864,6 @@ AutofishBox:AddToggle("Autofish", {
 		end
 	end,
 })
-
-local InfoBox = Tabs.Main:AddRightGroupbox("Info")
-
-InfoBox:AddLabel("Game: Ultimate Tower Defense", true)
-InfoBox:AddLabel("Status: Macro system loaded", true)
 
 --// Auto Banner tab
 -- banner ids follow the game's own pattern: Gold<Amateur|Intermediate|...|Experienced>Banner
@@ -2262,6 +2240,58 @@ RematchBox:AddToggle("AutoRematch", {
 		end
 	end,
 })
+
+--// Anti AFK: Infinite Yield's antiidle (VirtualInputManager click on Idled)
+local AntiAfkConn = nil
+
+local function setAntiAfk(on)
+	if on then
+		if AntiAfkConn then
+			return
+		end
+		AntiAfkConn = LocalPlayer.Idled:Connect(function()
+			if not myGenAlive() then
+				return
+			end
+			local okV, vim = pcall(Instance.new, "VirtualInputManager")
+			if okV and vim then
+				pcall(function()
+					vim:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+					vim:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+				end)
+				vim:Destroy()
+			else
+				-- fallback for executors where VirtualInputManager is blocked
+				local okU, vu = pcall(function()
+					return game:GetService("VirtualUser")
+				end)
+				if okU and vu then
+					pcall(function()
+						vu:CaptureController()
+						vu:ClickButton2(Vector2.new(0, 0))
+					end)
+				end
+			end
+		end)
+	elseif AntiAfkConn then
+		AntiAfkConn:Disconnect()
+		AntiAfkConn = nil
+	end
+end
+
+local AntiAfkBox = Tabs.Automation:AddLeftGroupbox("Anti AFK")
+
+AntiAfkBox:AddToggle("AntiAfk", {
+	Default = true,
+	Text = "Anti AFK",
+	Tooltip = "Infinite Yield antiidle: clicks on the Idled event so Roblox does not kick you. Off = normal AFK behavior.",
+	Callback = function(Value)
+		setAntiAfk(Value)
+	end,
+})
+
+-- apply the default now; restoreUI overrides it with the saved value
+setAntiAfk(Toggles.AntiAfk.Value)
 
 -- earnings report: matches played x 18,750 per match
 local matchesPlayed = 0
@@ -3366,6 +3396,7 @@ end
 Library:OnUnload(function()
 	persistUI() -- one last snapshot on the way out
 	ReExec.clearTarget() -- cancel a queued re-execute on manual unload
+	setAntiAfk(false)
 	RECORDING = false
 	RecState = "idle"
 	PAUSE_AT = nil
