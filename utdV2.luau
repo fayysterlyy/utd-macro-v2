@@ -1466,6 +1466,7 @@ local Tabs = {
 	["Auto Match"] = Window:AddTab("Auto Match"),
 	["Auto Fish"] = Window:AddTab("Auto Fish"),
 	["Auto Banner"] = Window:AddTab("Auto Banner"),
+	["Auto Dungeon"] = Window:AddTab("Auto Dungeon"),
 	["UI Settings"] = Window:AddTab("UI Settings"),
 }
 
@@ -2293,8 +2294,11 @@ AntiAfkBox:AddToggle("AntiAfk", {
 -- apply the default now; restoreUI overrides it with the saved value
 setAntiAfk(Toggles.AntiAfk.Value)
 
--- earnings report: matches played x 18,750 per match
-local matchesPlayed = 0
+-- last Gameover payload: the GlobalInit/Gameover channel carries the full
+-- reward table (goldReward, expReward, ExtraReward). The webhook reports THIS
+-- instead of a match counter - counting MatchBegun was unreliable, because the
+-- one-shot event can fire before the listener attaches.
+local LAST_RESULT = nil
 local webhookRun = 0
 
 -- where the player is right now (Lobby / Match + map + wave)
@@ -2346,7 +2350,6 @@ local function sendEarnings(test)
 		notify("Webhook", "Paste a webhook URL first", 4)
 		return false
 	end
-	local total = matchesPlayed * 18750
 	local info = serverInfo()
 	local who = LocalPlayer.Name
 	pcall(function()
@@ -2358,17 +2361,49 @@ local function sendEarnings(test)
 	if botName == "" then
 		botName = "UTD Bot"
 	end
+	local r = LAST_RESULT
+	local fields = {
+		{ name = "Player", value = who, inline = true },
+		{ name = "Status", value = info.where .. " | " .. info.map .. " | Wave " .. info.wave, inline = true },
+	}
+	if type(r) == "table" then
+		-- the server's own reward table, reported as-is
+		table.insert(fields, { name = "Gold", value = tostring(r.goldReward or 0), inline = true })
+		table.insert(fields, { name = "Exp", value = tostring(r.expReward or 0), inline = true })
+		local extra = r.ExtraReward
+		if type(extra) == "table" then
+			-- one field per extra reward (CursedSpeech, DungeonToken, ...) so
+			-- Discord renders them as separate values instead of a blob
+			local names = {}
+			for k in pairs(extra) do
+				names[#names + 1] = tostring(k)
+			end
+			table.sort(names)
+			for _, k in ipairs(names) do
+				table.insert(fields, { name = k, value = tostring(extra[k]), inline = true })
+			end
+		end
+		if r.winningTeam ~= nil then
+			table.insert(fields, { name = "Result", value = tostring(r.winningTeam), inline = true })
+		end
+		if r.roundTime ~= nil then
+			table.insert(fields, { name = "Round time", value = tostring(r.roundTime) .. "s", inline = true })
+		end
+		if r.currency ~= nil then
+			table.insert(fields, { name = "Currency", value = tostring(r.currency), inline = true })
+		end
+		if r.at then
+			table.insert(fields, { name = "Last match", value = tostring(r.at), inline = false })
+		end
+	else
+		table.insert(fields, { name = "Rewards", value = "no match finished yet", inline = true })
+	end
 	local payload = {
 		username = botName,
 		embeds = { {
-			title = "UTD Earnings Report" .. (test and " (Test)" or ""),
+			title = "UTD Match Rewards" .. (test and " (Test)" or ""),
 			color = 3066993,
-			fields = {
-				{ name = "Player", value = who, inline = true },
-				{ name = "Status", value = info.where .. " | " .. info.map .. " | Wave " .. info.wave, inline = true },
-				{ name = "Matches played", value = tostring(matchesPlayed), inline = true },
-				{ name = "Earnings", value = formatCash(total), inline = true },
-			},
+			fields = fields,
 			timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
 		} },
 	}
@@ -2982,6 +3017,761 @@ task.spawn(function()
 		end
 	end
 end)
+--// Auto Dungeon tab: match-flow automation (back-from-11, auto next),
+-- Forsaken Prison auto-place, and best-challenge voting. The flow callbacks
+-- at the bottom of this block are invoked from onMatchStart/onMatchEnd, which
+-- are declared much further down.
+local DungeonFlowBox = Tabs["Auto Dungeon"]:AddLeftGroupbox("Dungeon Flow")
+local DungeonPlaceBox = Tabs["Auto Dungeon"]:AddRightGroupbox("Auto Place")
+local DungeonChallengeBox = Tabs["Auto Dungeon"]:AddLeftGroupbox("Challenge")
+
+-- run counters: bumping one aborts every thread still holding the old value
+local backFrom10Run = 0
+local autoNextRun = 0
+local autoPlaceRun = 0
+local challengeRun = 0
+
+-- Auto Back from 10: armed only for a "Forsaken Prison - Floor 10" match
+local backFrom10Armed = false
+local backFrom10Fired = false
+
+-- Auto Place shared state (reset on every new match)
+local autoPlaceFirstId = nil -- entity id the server assigns to the first tower
+local autoPlaceWave4Done = false
+local autoPlaceWave5Done = false
+-- pending place calls awaiting the server's TowerPlacedSuccessfully id reply.
+-- Mirrors the macro's takePlace/fallbackShift: match the reply's asset type
+-- (a2) to a queued place; on a type miss, fall back to FIFO order after 3
+-- misses so the id is never lost even if a2 comes back in an unexpected form.
+local autoPlaceQueue = {} -- each entry: { asset = <assetId>, first = <bool> }
+local autoTpsMissStreak = 0
+
+-- exact asset-type match, else FIFO fallback after 3 misses (macro parity)
+local function autoTakePlace(typ)
+	if #autoPlaceQueue == 0 then
+		return nil
+	end
+	if typ then
+		for i, rec in ipairs(autoPlaceQueue) do
+			if rec.asset == typ then
+				autoTpsMissStreak = 0
+				return table.remove(autoPlaceQueue, i)
+			end
+		end
+	end
+	autoTpsMissStreak += 1
+	if autoTpsMissStreak >= 3 then
+		autoTpsMissStreak = 0
+		warn("[UTD] Auto Place: tower id/type mismatch 3x - order fallback")
+		return table.remove(autoPlaceQueue, 1)
+	end
+	return nil
+end
+-- last named MatchBegun, so a duplicate begun cannot restart a live sequence
+local dungeonLastNamedStart = 0
+
+-- called from onMatchStart / onMatchEnd; assigned at the bottom of this block
+local dungeonOnMatchStart
+local dungeonOnMatchEnd
+
+local DungeonPlaceLabel = DungeonPlaceBox:AddLabel("Auto Place: idle", true)
+local DungeonChallengeLabel = DungeonChallengeBox:AddLabel("Challenge: idle", true)
+
+local function setPlaceLabel(text)
+	if DungeonPlaceLabel then
+		pcall(function()
+			DungeonPlaceLabel:SetText("Auto Place: " .. text)
+		end)
+	end
+end
+
+local function setChallengeLabel(text)
+	if DungeonChallengeLabel then
+		pcall(function()
+			DungeonChallengeLabel:SetText("Challenge: " .. text)
+		end)
+	end
+end
+
+-- fire a GlobalInit RemoteEvents remote by name. Resolved fresh on every shot
+-- (the instances rotate with the match server) and always pcall-wrapped.
+local function fireGlobalEvent(name, arg)
+	local re = resolvePath("ReplicatedStorage.Modules.GlobalInit.RemoteEvents")
+	local remote = re and re:FindFirstChild(name)
+	if not remote then
+		return false
+	end
+	local ok
+	if arg ~= nil then
+		ok = pcall(function()
+			remote:FireServer(arg)
+		end)
+	else
+		ok = pcall(function()
+			remote:FireServer()
+		end)
+	end
+	return ok
+end
+
+-- place remote lives under GenericModules.Service.Network (NOT GlobalInit)
+local function placeTower(typeId, pos)
+	local net = resolvePath("ReplicatedStorage.GenericModules.Service.Network")
+	local place = net and net:FindFirstChild("PlayerPlaceTower")
+	if not place then
+		warn("[UTD] PlayerPlaceTower not found")
+		return false
+	end
+	local ok = pcall(function()
+		place:FireServer(typeId, pos, 0)
+	end)
+	return ok
+end
+
+--// Auto Place: fixed Forsaken Prison layout (all floors), no macro needed.
+-- Slots follow the hotbar order: 1=824 God-Killing Spear $1200,
+-- 2=529 Cyborg $300, 3=856 Yumeo $400, 4=805 Gukoo $600,
+-- 5=835 The Drink $7500, 6=918 Power $1000.
+local AUTO_A_TYPE = "11390384660:856" -- slot 3 (Yumeo)
+local AUTO_A_POS = Vector3.new(-187.16935729980469, -296.7825927734375, -393.63858032226562)
+local AUTO_B_TYPE = "11390384660:824" -- slot 1 (God-Killing Spear)
+local AUTO_B_POS = Vector3.new(-180.87001037597656, -296.77581787109375, -406.19381713867188)
+local WAVE4_TYPE = "11390384660:529" -- slot 2 (Cyborg)
+local WAVE4_POS = {
+	Vector3.new(-84.172805786132812, -296.78067016601562, -397.48211669921875),
+	Vector3.new(-84.092041015625, -296.77944946289062, -399.79217529296875),
+	Vector3.new(-84.439216613769531, -296.78448486328125, -390.32281494140625),
+	Vector3.new(-84.505935668945312, -296.78598022460938, -387.5528564453125),
+	Vector3.new(-88.978164672851562, -296.78445434570312, -390.41397094726562),
+}
+local WAVE5_SET = {
+	{ "11390384660:918", Vector3.new(-105.44878387451172, -292.912109375, -471.07028198242188) }, -- slot 6 (Power)
+	{ "11390384660:918", Vector3.new(-105.51194763183594, -292.90679931640625, -321.0914306640625) }, -- slot 6 (Power)
+	{ "11390384660:835", Vector3.new(-102.75198364257812, -296.78472900390625, -389.87875366210938) }, -- slot 5 (The Drink)
+}
+
+-- the whole sequence dies the moment the run id, the generation, or the
+-- toggle changes (match end starts a fresh run)
+local function autoPlaceSequence(myRun)
+	local function alive()
+		return myRun == autoPlaceRun
+			and STATE.alive() and myGenAlive()
+			and Toggles.AutoPlace and Toggles.AutoPlace.Value
+	end
+	-- never fire while a capture or replay owns the place stream (their spends
+	-- would pollute the live cash log)
+	if RecState == "recording" or RecState == "paused" or ReplayCtx then
+		setPlaceLabel("paused (recording/replay active)")
+	end
+	while alive() and (RecState == "recording" or RecState == "paused" or ReplayCtx) do
+		task.wait(0.25)
+	end
+	if not alive() then
+		return
+	end
+
+	setPlaceLabel("placing A + B")
+	placeTower(AUTO_A_TYPE, AUTO_A_POS)
+	-- queue A so the server's id reply is matched to it (first tower = ability)
+	table.insert(autoPlaceQueue, { asset = AUTO_A_TYPE, first = true })
+	task.wait(5)
+	if not alive() then
+		return
+	end
+	placeTower(AUTO_B_TYPE, AUTO_B_POS)
+	table.insert(autoPlaceQueue, { asset = AUTO_B_TYPE, first = false })
+	setPlaceLabel("A + B placed, waiting wave 4")
+
+	-- wave 4 milestone (once per match)
+	while alive() and not autoPlaceWave4Done do
+		task.wait(0.25)
+		local w = currentWaveNum()
+		if w and w >= 4 then
+			autoPlaceWave4Done = true
+		end
+	end
+	if not alive() then
+		return
+	end
+
+	-- fire the first tower's ability; its entity id may still be in flight
+	local waited = 0
+	while alive() and not autoPlaceFirstId and waited < 5 do
+		task.wait(0.25)
+		waited += 0.25
+	end
+	if not alive() then
+		return
+	end
+	if autoPlaceFirstId then
+		fireGlobalEvent("PlayerActivateTowerAbility", autoPlaceFirstId)
+	else
+		setPlaceLabel("wave 4: first id missing, ability skipped")
+		warn("[UTD] Auto Place: first tower id never arrived")
+	end
+
+	for i, pos in ipairs(WAVE4_POS) do
+		if not alive() then
+			return
+		end
+		placeTower(WAVE4_TYPE, pos)
+		setPlaceLabel(string.format("wave 4 %d/%d", i, #WAVE4_POS))
+		task.wait(0.5)
+	end
+
+	-- wave 5 milestone (once per match)
+	while alive() and not autoPlaceWave5Done do
+		task.wait(0.25)
+		local w = currentWaveNum()
+		if w and w >= 5 then
+			autoPlaceWave5Done = true
+		end
+	end
+	if not alive() then
+		return
+	end
+
+	for i, rec in ipairs(WAVE5_SET) do
+		if not alive() then
+			return
+		end
+		placeTower(rec[1], rec[2])
+		setPlaceLabel(string.format("wave 5 %d/%d", i, #WAVE5_SET))
+		task.wait(0.5)
+	end
+	setPlaceLabel("done")
+end
+
+--// Challenge priority: top = best. The offered trio is scored 1..26 and the
+-- lowest score wins. (Ported from the removed Auto Dungeon block.)
+local CHALLENGE_RANK = {
+	BleedingImmunity = 1,
+	BurningImmunity = 2,
+	PoisonImmunity = 3,
+	TimestopImmunity = 4,
+	SlowImmunity = 5,
+	DoubleBosses = 6,
+	Healer = 7,
+	NoRefunds = 8,
+	Tank = 9,
+	EnemyHealth = 10,
+	EnemySpeed = 11,
+	EnemySpawnCount = 12,
+	TowerDamage = 13,
+	TowerDegrading = 14,
+	TowerRange = 15,
+	Explosive = 16,
+	NoSelling = 17,
+	ShieldHealth = 18,
+	Shielded = 19,
+	UselessArtifacts = 20,
+	UselessFarms = 21,
+	SinglePlacement = 22,
+	UselessTraits = 23,
+	ElementalShield = 24,
+	Stealth = 25,
+	DoubleTowerCosts = 26,
+}
+
+local dungTitleMap = {}
+local dungLastScreenSig = nil
+local dungLastUnknownSig = nil
+local dungLastUnreadable = nil
+
+-- Challenge vote sender: fires the pick 4 times, 1s apart, re-resolving the
+-- remote every time. If the first shot is dropped the rest cover it; repeat
+-- votes for the same slot are harmless.
+local function fireChallengeVote(pick, tag)
+	local myRun = challengeRun
+	task.spawn(function()
+		for i = 1, 4 do
+			if myRun ~= challengeRun then
+				break
+			end
+			if not (Toggles.AutoBestChallenge and Toggles.AutoBestChallenge.Value) then
+				break
+			end
+			if not (STATE.alive() and myGenAlive()) then
+				break
+			end
+			if i > 1 then
+				task.wait(1)
+			end
+			if myRun ~= challengeRun then
+				break
+			end
+			if not (Toggles.AutoBestChallenge and Toggles.AutoBestChallenge.Value) then
+				break
+			end
+			if not fireGlobalEvent("PlayerVoteForChallenge", pick) then
+				warn("[UTD] PlayerVoteForChallenge not found")
+				break
+			end
+		end
+		print("[UTD] challenge vote x4 sent: " .. tostring(pick) .. " (" .. tostring(tag) .. ")")
+	end)
+end
+
+-- Challenge screen fallback: if the vote remote is ever missed, read the open
+-- "Select a Challenge" cards and vote the best. Title->id pairs are LEARNED
+-- whenever remote + screen coincide (exact, no guessing); unknown titles are
+-- reported, never guessed.
+local function readChallengeTitles()
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	local mg = pg and pg:FindFirstChild("MainGui")
+	local cc = mg and mg:FindFirstChild("ChallengeCardSelection")
+	if not cc or not cc.Visible then
+		return nil
+	end
+	local function cardsOf(listName)
+		local list = cc:FindFirstChild(listName)
+		if not list then
+			return nil
+		end
+		local out = {}
+		for i = 1, 3 do
+			local card = list:FindFirstChild(tostring(i))
+			if not card or not card.Visible then
+				return nil
+			end
+			-- the real card title (game code writes it to Foreground.PathName)
+			local title = nil
+			local pn = card:FindFirstChild("PathName", true)
+			if pn and (pn:IsA("TextLabel") or pn:IsA("TextButton")) then
+				local t = tostring(pn.Text or "")
+				if t ~= "" then
+					title = t
+				end
+			end
+			if not title then
+				-- fallback: first sensible label (skip counters/rewards)
+				for _, d in ipairs(card:GetDescendants()) do
+					if d:IsA("TextLabel") then
+						local t = tostring(d.Text or "")
+						if t ~= "" and t ~= "Rubies" and not t:match("^x%d+$")
+							and not t:match("^[%+%-]%d+$")
+							and not t:find("Time Remaining", 1, true) and #t < 40 then
+							title = t
+							break
+						end
+					end
+				end
+			end
+			if not title then
+				return nil
+			end
+			out[#out + 1] = title
+		end
+		return out
+	end
+	return cardsOf("NormalChallengeList") or cardsOf("HardcoreChallengeList") or false
+	-- false = the screen is open but the card layout is not understood
+	-- (nil = the screen is simply closed)
+end
+
+local function learnChallengeTitles(ids)
+	local titles = readChallengeTitles()
+	if not titles or #titles ~= #ids then
+		return
+	end
+	for i, title in ipairs(titles) do
+		if ids[i] and dungTitleMap[title] ~= ids[i] then
+			dungTitleMap[title] = ids[i]
+			print("[UTD] learned challenge: '" .. title .. "' = " .. tostring(ids[i]))
+		end
+	end
+end
+
+-- fuzzy title -> id for unlearned cards: stem both sides the same way and
+-- count shared tokens. Returns the id only on a STRICTLY unique best, else
+-- nil (a wrong vote is worse than no vote).
+local function stemWord(w)
+	w = w:lower()
+	w = w:gsub("ing$", "")
+	if #w > 4 and not w:match("ss$") then
+		w = w:gsub("s$", "")
+	end
+	return w
+end
+
+local function fuzzyChallengeId(title)
+	local titleToks = {}
+	for w in tostring(title):gmatch("%w+") do
+		titleToks[#titleToks + 1] = stemWord(w)
+	end
+	local best, bestScore, bestCount = nil, 0, 0
+	for id in pairs(CHALLENGE_RANK) do
+		local score = 0
+		for iw in tostring(id):gmatch("%u%l*") do
+			local sw = stemWord(iw)
+			for _, tw in ipairs(titleToks) do
+				if sw == tw then
+					score += 1
+					break
+				end
+			end
+		end
+		if score > bestScore then
+			best, bestScore, bestCount = id, score, 1
+		elseif score == bestScore and score > 0 then
+			bestCount += 1
+		end
+	end
+	if best and bestCount == 1 then
+		return best
+	end
+	return nil
+end
+
+--// Auto Dungeon toggles
+DungeonFlowBox:AddToggle("BackFrom10", {
+	Default = false,
+	Text = "Auto Back from 10",
+	Tooltip = "The instant a Forsaken Prison Floor 10 match starts, teleports back to the lobby.",
+	Callback = function(Value)
+		if not Value then
+			backFrom10Run += 1 -- abort
+			backFrom10Armed = false
+			backFrom10Fired = false
+		end
+	end,
+})
+
+DungeonFlowBox:AddToggle("AutoNext", {
+	Default = false,
+	Text = "Auto Next",
+	Tooltip = "Votes PlayerVoteReplay 3x (0.5s apart) after every match end.",
+	Callback = function(Value)
+		if not Value then
+			autoNextRun += 1 -- abort
+		end
+	end,
+})
+
+DungeonPlaceBox:AddToggle("AutoPlace", {
+	Default = false,
+	Text = "Auto Place (Forsaken Prison)",
+	Tooltip = "On a Forsaken Prison match, places the fixed tower set and runs the wave-4/5 sequence. No macro needed.",
+	Callback = function(Value)
+		if Value then
+			autoPlaceRun += 1
+			setPlaceLabel("waiting MatchBegun")
+		else
+			autoPlaceRun += 1 -- abort
+			autoPlaceFirstId = nil
+			setPlaceLabel("off")
+		end
+	end,
+})
+
+DungeonChallengeBox:AddToggle("AutoBestChallenge", {
+	Default = false,
+	Text = "Auto Select Best Challenge",
+	Tooltip = "Votes the best-ranked of the three offered challenges.",
+	Callback = function(Value)
+		if Value then
+			setChallengeLabel("waiting for challenge screen...")
+		else
+			challengeRun += 1 -- abort
+			dungLastScreenSig = nil
+			dungLastUnknownSig = nil
+			dungLastUnreadable = nil
+			setChallengeLabel("off")
+		end
+	end,
+})
+
+--// Auto Place: capture the entity id the server assigns to the first tower
+-- (the place call only sends the asset id; the reply carries the entity id).
+-- Matching mirrors the macro's proven takePlace/fallbackShift: the reply's
+-- asset (a2) is matched to a queued place; on a type miss the queue falls
+-- back to FIFO order after 3 misses, so the id is never lost to an odd reply.
+task.spawn(function()
+	local tps
+	while not tps and STATE.alive() and myGenAlive() do
+		tps = resolvePath("ReplicatedStorage.Modules.GlobalInit.RemoteEvents.TowerPlacedSuccessfully")
+		if not tps then
+			task.wait(1)
+		end
+	end
+	if tps then
+		STATE.connect(tps.OnClientEvent, function(a1, a2)
+			if not myGenAlive() then
+				return
+			end
+			local eid = a1 ~= nil and tostring(a1) or nil
+			if not eid then
+				return
+			end
+			local rec = autoTakePlace(a2 ~= nil and tostring(a2) or nil)
+			if rec and rec.first then
+				autoPlaceFirstId = eid
+			end
+		end)
+	else
+		warn("[UTD] TowerPlacedSuccessfully remote not found")
+	end
+end)
+
+--// Challenge screen poll: fast, so the pick lands the moment the cards show
+task.spawn(function()
+	while STATE.alive() and myGenAlive() do
+		task.wait(0.5)
+		if not (Toggles.AutoBestChallenge and Toggles.AutoBestChallenge.Value) then
+			dungLastScreenSig = nil
+			dungLastUnreadable = nil
+		else
+			local titles = readChallengeTitles()
+			if titles == false then
+				-- screen open, cards unreadable: shout ONCE instead of silence
+				dungLastScreenSig = nil
+				if not dungLastUnreadable then
+					dungLastUnreadable = true
+					warn("[UTD] challenge screen is open but the cards could not be read")
+					setChallengeLabel("screen open, cards unreadable!")
+				end
+			elseif not titles then
+				dungLastScreenSig = nil
+				dungLastUnreadable = nil
+			else
+				dungLastUnreadable = nil
+				local sig = table.concat(titles, "|")
+				if sig ~= dungLastScreenSig then
+					-- resolve all three: learned pairs first, fuzzy match
+					-- (unique best only) as backup
+					local ids, okAll = {}, true
+					for _, title in ipairs(titles) do
+						local id = dungTitleMap[title]
+						if not id then
+							id = fuzzyChallengeId(title)
+							if id then
+								dungTitleMap[title] = id
+								print("[UTD] screen vote: fuzzy '" .. title .. "' = " .. id)
+							end
+						end
+						if not id then
+							okAll = false
+							if sig ~= dungLastUnknownSig then
+								dungLastUnknownSig = sig
+								print("[UTD] screen vote: unknown title '" .. title .. "' (waiting remote)")
+							end
+							break
+						end
+						ids[#ids + 1] = id
+					end
+					if okAll then
+						local pick, pickScore = 1, math.huge
+						for i, name in ipairs(ids) do
+							local score = CHALLENGE_RANK[name] or math.huge
+							if score < pickScore then
+								pick, pickScore = i, score
+							end
+						end
+						dungLastScreenSig = sig
+						print("[UTD] screen vote: " .. table.concat(titles, ", ") .. " -> picking " .. pick)
+						setChallengeLabel("picked " .. pick .. " (" .. ids[pick] .. ") [screen]")
+						fireChallengeVote(pick, ids[pick] .. " screen")
+					end
+				end
+			end
+		end
+	end
+end)
+
+--// Challenge vote (primary): server opens ServerStartChallengeVote(options);
+-- while the toggle is on, answer with the best-ranked slot. The listener
+-- re-attaches whenever the remote instance rotates, so no vote is missed.
+task.spawn(function()
+	local connected = nil
+	while STATE.alive() and myGenAlive() do
+		local re = resolvePath("ReplicatedStorage.Modules.GlobalInit.RemoteEvents")
+		local voteRemote = re and re:FindFirstChild("ServerStartChallengeVote")
+		if voteRemote and voteRemote ~= connected then
+			connected = voteRemote
+			STATE.connect(voteRemote.OnClientEvent, function(options)
+				if not myGenAlive() then
+					return
+				end
+				if not (Toggles.AutoBestChallenge and Toggles.AutoBestChallenge.Value) then
+					return
+				end
+				local names = {}
+				if type(options) == "table" then
+					for _, v in ipairs(options) do
+						names[#names + 1] = tostring(v)
+					end
+				end
+				if #names == 0 then
+					return
+				end
+				-- lowest rank wins; unknown names sort last and never win
+				-- against a known one
+				local pick, pickScore = 1, math.huge
+				for i, name in ipairs(names) do
+					local score = CHALLENGE_RANK[name] or math.huge
+					if score < pickScore then
+						pick, pickScore = i, score
+					end
+				end
+				print("[UTD] challenge vote: " .. table.concat(names, ", ") .. " -> picking " .. pick .. " (" .. names[pick] .. ")")
+				setChallengeLabel("picked " .. pick .. " (" .. names[pick] .. ")")
+				learnChallengeTitles(names)
+				fireChallengeVote(pick, names[pick])
+			end)
+		end
+		task.wait(1) -- re-check fast: the remote appears only at match start
+	end
+end)
+
+--// Auto Dungeon flow hooks (invoked from onMatchStart / onMatchEnd below).
+-- Only the NAMED MatchBegun event carries a map: the nameless poll/attach
+-- retries must not restart or kill a running sequence.
+dungeonOnMatchStart = function(mapName)
+	-- a named MatchBegun is canonical; the attach/poll retries carry no name
+	-- (they fire when the script loaded AFTER the event), so fall back to the
+	-- live proxy - without this the sequence never starts on a mid-match load
+	local name
+	if mapName ~= nil and tostring(mapName) ~= "" then
+		name = tostring(mapName)
+	else
+		name = tostring(currentMapName(true) or currentMapName() or "")
+		if name == "" and matchRunning() then
+			-- live seen on floor 1: the one-shot MatchBegun fires the instant
+			-- the remote is (re)created, i.e. before the listener can attach,
+			-- and the proxy mapId is not filled yet - so the nameless retry
+			-- returned and the flow only started at floor 2 where the remote
+			-- rotates again and the reconnect wins the race. A nameless LIVE
+			-- match is therefore treated as Forsaken Prison (this toggle is
+			-- only used inside the dungeon queue).
+			name = "Forsaken Prison"
+		end
+	end
+	if name == "" then
+		return
+	end
+	-- display and queue spell the map differently ("Forsaken Prison - Floor 3"
+	-- vs "ForsakenPrison" / "Forsaken_Prison"): compare ignoring case and
+	-- every non-letter/number character
+	local flat = name:lower():gsub("[^%w]", "")
+	local isForsaken = flat:find("forsakenprison", 1, true) ~= nil
+	local isFloor10 = flat:find("floor10", 1, true) ~= nil
+	local namedStart = mapName ~= nil and tostring(mapName) ~= ""
+	local now = os.clock()
+	-- the debounce only guards duplicate starts of the SAME match: it must
+	-- never be armed by a nameless attach (proxy guess), or the real named
+	-- MatchBegun that follows would be debounced away and the sequence skipped
+	if isForsaken and now - dungeonLastNamedStart < 2 then
+		return -- duplicate begun for the same match
+	end
+	if isForsaken then
+		dungeonLastNamedStart = now
+	end
+
+	-- Auto Place: one sequence per match, Forsaken Prison only
+	if Toggles.AutoPlace and Toggles.AutoPlace.Value then
+		autoPlaceRun += 1
+		autoPlaceFirstId = nil
+		autoPlaceWave4Done = false
+		autoPlaceWave5Done = false
+		autoPlaceQueue = {}
+		autoTpsMissStreak = 0
+		if isForsaken then
+			local myRun = autoPlaceRun
+			task.spawn(function()
+				autoPlaceSequence(myRun)
+			end)
+		elseif namedStart then
+			-- only a NAMED begun may give wrong-name feedback: a nameless
+			-- attach guesses the map from the proxy and may spell it in the
+			-- queue form, which the display-name check would reject
+			setPlaceLabel("idle (not Forsaken Prison)")
+		end
+	else
+		autoPlaceRun += 1
+		autoPlaceFirstId = nil
+	end
+
+	-- Auto Back from 10: the instant a Floor 10 match starts, teleport straight
+	-- back to the lobby - no waiting for the match to end. backFrom10Armed
+	-- still keeps Auto Next from firing a replay vote on this match's end.
+	if Toggles.BackFrom10 and Toggles.BackFrom10.Value then
+		if isForsaken and isFloor10 then
+			backFrom10Armed = true
+			if not backFrom10Fired then
+				-- the shot goes out immediately; retry briefly because a
+				-- match-scoped remote can be a beat behind the started event
+				if fireGlobalEvent("PlayerRequestTeleportToLobby") then
+					backFrom10Fired = true
+					notify("Auto Back from 10", "Floor 10 - back to lobby", 3)
+				else
+					task.spawn(function()
+						for _ = 1, 8 do
+							task.wait(0.5)
+							if not (STATE.alive() and myGenAlive()) then
+								return
+							end
+							if fireGlobalEvent("PlayerRequestTeleportToLobby") then
+								backFrom10Fired = true
+								notify("Auto Back from 10", "Floor 10 - back to lobby", 3)
+								return
+							end
+						end
+					end)
+				end
+			end
+		else
+			backFrom10Armed = false
+			backFrom10Fired = false -- re-arm for a future Floor 10
+		end
+	else
+		backFrom10Armed = false
+		backFrom10Fired = false
+	end
+end
+
+dungeonOnMatchEnd = function()
+	-- Auto Next: 3 replay votes, 0.5s apart. Skipped on a Floor 10 (armed for
+	-- lobby return): a replay vote here could swallow the lobby teleport.
+	if Toggles.AutoNext and Toggles.AutoNext.Value and not backFrom10Armed then
+		autoNextRun += 1
+		local id = autoNextRun
+		task.spawn(function()
+			for _ = 1, 3 do
+				task.wait(0.5)
+				if id ~= autoNextRun then
+					return
+				end
+				if not (Toggles.AutoNext and Toggles.AutoNext.Value) then
+					return
+				end
+				if not (STATE.alive() and myGenAlive()) then
+					return
+				end
+				fireGlobalEvent("PlayerVoteReplay")
+			end
+		end)
+	end
+
+	-- Auto Back from 10: safety net only - the instant shot on MatchBegun is
+	-- the normal path, this catches the rare case where that shot never went
+	-- out (backFrom10Fired stays false).
+	if Toggles.BackFrom10 and Toggles.BackFrom10.Value and backFrom10Armed and not backFrom10Fired then
+		backFrom10Fired = true
+		backFrom10Armed = false
+		if fireGlobalEvent("PlayerRequestTeleportToLobby") then
+			notify("Auto Back from 10", "Return vote sent", 3)
+		end
+	end
+
+	-- Auto Place: the next MatchBegun resets these anyway; clear them here so
+	-- an id from the finished match can never be reused
+	autoPlaceFirstId = nil
+	autoPlaceWave4Done = false
+	autoPlaceWave5Done = false
+	autoPlaceQueue = {}
+	autoTpsMissStreak = 0
+end
+
 -- forward declarations: the poll below fires before these are defined, and
 -- Lua only sees locals declared ABOVE the caller - so declare first, assign
 -- at their original spots.
@@ -3127,6 +3917,13 @@ local function onMatchStart(source, mapName)
 	if not myGenAlive() then
 		return
 	end
+	--// Auto Dungeon: fires the instant MatchBegun lands. Called FIRST, before
+	-- anything that could yield (beginCapture / maybeAutoReplay can task.wait
+	-- up to ~1.5s in waitForStepRemotes), so the instant place is never late.
+	-- Named-event only: the nameless poll/attach retries no-op on nil mapName.
+	if dungeonOnMatchStart then
+		dungeonOnMatchStart(mapName)
+	end
 	-- learn the map BEFORE the debounce: the poll may already have started
 	-- the capture, and this event still owns the canonical map name
 	noteMatchMap(mapName)
@@ -3221,6 +4018,10 @@ onMatchEnd = function(victory, source)
 	if ReplayCtx then
 		stopReplay("match ended")
 	end
+	--// Auto Dungeon: match end drives auto-next / back-from-11 (block above)
+	if dungeonOnMatchEnd then
+		dungeonOnMatchEnd()
+	end
 end
 
 task.spawn(function()
@@ -3258,6 +4059,17 @@ task.spawn(function()
 	end
 	if GameoverRemote then
 		STATE.connect(GameoverRemote.OnClientEvent, function(result)
+			-- this channel carries the full reward table (goldReward, expReward,
+			-- ExtraReward); keep the latest one so the webhook reports the real
+			-- numbers. The Network/Gameover channel only carries a victory flag.
+			if type(result) == "table" then
+				local copy = {}
+				for k, v in pairs(result) do
+					copy[k] = v
+				end
+				copy.at = os.date("!%Y-%m-%d %H:%M:%S UTC")
+				LAST_RESULT = copy
+			end
 			onMatchEnd(result, "GlobalInit/Gameover")
 		end)
 	else
