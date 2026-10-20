@@ -1467,6 +1467,7 @@ local Tabs = {
 	["Auto Fish"] = Window:AddTab("Auto Fish"),
 	["Auto Banner"] = Window:AddTab("Auto Banner"),
 	["Auto Dungeon"] = Window:AddTab("Auto Dungeon"),
+	Misc = Window:AddTab("Misc"),
 	["UI Settings"] = Window:AddTab("UI Settings"),
 }
 
@@ -2280,9 +2281,10 @@ local function setAntiAfk(on)
 	end
 end
 
-local AntiAfkBox = Tabs.Automation:AddLeftGroupbox("Anti AFK")
+--// Misc tab: quality-of-life toggles that belong to no single farm
+local MiscBox = Tabs.Misc:AddLeftGroupbox("General")
 
-AntiAfkBox:AddToggle("AntiAfk", {
+MiscBox:AddToggle("AntiAfk", {
 	Default = true,
 	Text = "Anti AFK",
 	Tooltip = "Infinite Yield antiidle: clicks on the Idled event so Roblox does not kick you. Off = normal AFK behavior.",
@@ -2291,14 +2293,97 @@ AntiAfkBox:AddToggle("AntiAfk", {
 	end,
 })
 
+-- black screen: kills 3D rendering and covers the whole screen to save GPU.
+-- Rendering is restored (and the cover removed) the moment it is toggled off.
+local function setBlackScreen(on)
+	pcall(function()
+		game:GetService("RunService"):Set3dRenderingEnabled(not on)
+	end)
+	local root = (gethui and gethui()) or game:GetService("CoreGui")
+	if on then
+		if not root:FindFirstChild("BS") then
+			local g = Instance.new("ScreenGui")
+			g.Name = "BS"
+			g.IgnoreGuiInset = true
+			g.DisplayOrder = 999999
+			g.Parent = root
+			local f = Instance.new("Frame")
+			f.Size = UDim2.new(1, 0, 1, 0)
+			f.BackgroundColor3 = Color3.new(0, 0, 0)
+			f.BorderSizePixel = 0
+			f.Parent = g
+		end
+	else
+		pcall(function()
+			root.BS:Destroy()
+		end)
+	end
+end
+
+MiscBox:AddToggle("BlackScreen", {
+	Default = false,
+	Text = "Black Screen",
+	Tooltip = "Turns 3D rendering off and blacks out the screen to save GPU. Toggle it back off to restore.",
+	Callback = function(Value)
+		setBlackScreen(Value)
+	end,
+})
+
+local MiscInfoBox = Tabs.Misc:AddRightGroupbox("Info")
+local MiscPlayerLabel = MiscInfoBox:AddLabel("Player: ...", true)
+local MiscWhereLabel = MiscInfoBox:AddLabel("Where: ...", true)
+local MiscJobLabel = MiscInfoBox:AddLabel("JobId: ...", true)
+-- refreshed on a timer; every read is pcall-wrapped so a hiccup cannot
+-- kill the loop (serverInfo() lives further down, so it is not used here)
+task.spawn(function()
+	while STATE.alive() do
+		pcall(function()
+			MiscPlayerLabel:SetText("Player: " .. LocalPlayer.Name)
+		end)
+		pcall(function()
+			local rs = game:GetService("ReplicatedStorage")
+			local gm = rs:FindFirstChild("GenericModules")
+			local ob = gm and gm:FindFirstChild("Object")
+			local mod = ob and ob:FindFirstChild("NetworkProxy")
+			local where = "?"
+			if mod and mod:IsA("ModuleScript") then
+				local np = require(mod)
+				local root = np and np.root
+				if root then
+					where = tostring(root.serverType or "?")
+					local md = root.matchData
+					if md and md.mapId then
+						where ..= " | " .. tostring(md.mapId)
+					end
+				end
+			end
+			MiscWhereLabel:SetText("Where: " .. where)
+		end)
+		pcall(function()
+			MiscJobLabel:SetText("JobId: " .. tostring(game.JobId))
+		end)
+		task.wait(5)
+	end
+end)
+
 -- apply the default now; restoreUI overrides it with the saved value
 setAntiAfk(Toggles.AntiAfk.Value)
 
--- last Gameover payload: the GlobalInit/Gameover channel carries the full
--- reward table (goldReward, expReward, ExtraReward). The webhook reports THIS
--- instead of a match counter - counting MatchBegun was unreliable, because the
--- one-shot event can fire before the listener attaches.
-local LAST_RESULT = nil
+-- rewards accumulated across every finished match this session. The webhook
+-- reports the TOTALS, not just the last match. Fed by the GlobalInit/Gameover
+-- channel, which carries the full reward table (and is created once, so the
+-- listener keeps working match after match).
+local TOTAL_GOLD = 0
+local TOTAL_EXP = 0
+local TOTAL_EXTRA = {} -- reward name -> summed amount
+local MATCHES_DONE = 0
+-- reward names as they should read on Discord
+local EXTRA_NAME = {
+	DungeonToken = "Rubies",
+}
+local function extraLabel(key)
+	return EXTRA_NAME[key] or tostring(key)
+end
 local webhookRun = 0
 
 -- where the player is right now (Lobby / Match + map + wave)
@@ -2361,47 +2446,71 @@ local function sendEarnings(test)
 	if botName == "" then
 		botName = "UTD Bot"
 	end
-	local r = LAST_RESULT
+	-- compact top row (side by side), then a single stacked rewards block at
+	-- the bottom: a code block keeps the arrows aligned and reads cleanly
 	local fields = {
 		{ name = "Player", value = who, inline = true },
 		{ name = "Status", value = info.where .. " | " .. info.map .. " | Wave " .. info.wave, inline = true },
+		{ name = "Matches", value = tostring(MATCHES_DONE), inline = true },
 	}
-	if type(r) == "table" then
-		-- the server's own reward table, reported as-is
-		table.insert(fields, { name = "Gold", value = tostring(r.goldReward or 0), inline = true })
-		table.insert(fields, { name = "Exp", value = tostring(r.expReward or 0), inline = true })
-		local extra = r.ExtraReward
-		if type(extra) == "table" then
-			-- one field per extra reward (CursedSpeech, DungeonToken, ...) so
-			-- Discord renders them as separate values instead of a blob
-			local names = {}
-			for k in pairs(extra) do
-				names[#names + 1] = tostring(k)
-			end
-			table.sort(names)
-			for _, k in ipairs(names) do
-				table.insert(fields, { name = k, value = tostring(extra[k]), inline = true })
-			end
-		end
-		if r.winningTeam ~= nil then
-			table.insert(fields, { name = "Result", value = tostring(r.winningTeam), inline = true })
-		end
-		if r.roundTime ~= nil then
-			table.insert(fields, { name = "Round time", value = tostring(r.roundTime) .. "s", inline = true })
-		end
-		if r.currency ~= nil then
-			table.insert(fields, { name = "Currency", value = tostring(r.currency), inline = true })
-		end
-		if r.at then
-			table.insert(fields, { name = "Last match", value = tostring(r.at), inline = false })
-		end
+	local lines
+	if MATCHES_DONE == 0 then
+		lines = { "no match finished yet" }
 	else
-		table.insert(fields, { name = "Rewards", value = "no match finished yet", inline = true })
+		-- Gold / Rubies / Exp lead; every other extra reward sits below a blank
+		-- line so the main currencies stay easy to read
+		local top = {
+			{ "Gold", formatCash(TOTAL_GOLD) },
+		}
+		if TOTAL_EXTRA.DungeonToken then
+			top[#top + 1] = { extraLabel("DungeonToken"), tostring(TOTAL_EXTRA.DungeonToken) }
+		end
+		top[#top + 1] = { "Exp", tostring(TOTAL_EXP) }
+		-- every other extra reward, alphabetically
+		local rest = {}
+		local keys = {}
+		for k in pairs(TOTAL_EXTRA) do
+			if k ~= "DungeonToken" then
+				keys[#keys + 1] = k
+			end
+		end
+		table.sort(keys, function(a, b)
+			return extraLabel(a) < extraLabel(b)
+		end)
+		for _, k in ipairs(keys) do
+			rest[#rest + 1] = { extraLabel(k), tostring(TOTAL_EXTRA[k]) }
+		end
+		-- one shared pad so the arrows line up across BOTH groups
+		local pad = 0
+		for _, r in ipairs(top) do
+			pad = math.max(pad, #r[1])
+		end
+		for _, r in ipairs(rest) do
+			pad = math.max(pad, #r[1])
+		end
+		local function line(r)
+			return r[1] .. string.rep(" ", pad - #r[1]) .. " -> " .. r[2]
+		end
+		lines = {}
+		for _, r in ipairs(top) do
+			lines[#lines + 1] = line(r)
+		end
+		if #rest > 0 then
+			lines[#lines + 1] = "" -- spacer between the two groups
+			for _, r in ipairs(rest) do
+				lines[#lines + 1] = line(r)
+			end
+		end
 	end
+	table.insert(fields, {
+		name = "Totals",
+		value = "```" .. table.concat(lines, "\n") .. "```",
+		inline = false,
+	})
 	local payload = {
 		username = botName,
 		embeds = { {
-			title = "UTD Match Rewards" .. (test and " (Test)" or ""),
+			title = "Rewards" .. (test and " (Test)" or ""),
 			color = 3066993,
 			fields = fields,
 			timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
@@ -4060,15 +4169,22 @@ task.spawn(function()
 	if GameoverRemote then
 		STATE.connect(GameoverRemote.OnClientEvent, function(result)
 			-- this channel carries the full reward table (goldReward, expReward,
-			-- ExtraReward); keep the latest one so the webhook reports the real
-			-- numbers. The Network/Gameover channel only carries a victory flag.
+			-- ExtraReward). Fold it into the running totals the webhook reports.
+			-- The Network/Gameover channel only carries a victory flag.
 			if type(result) == "table" then
-				local copy = {}
-				for k, v in pairs(result) do
-					copy[k] = v
+				MATCHES_DONE += 1
+				TOTAL_GOLD += tonumber(result.goldReward) or 0
+				TOTAL_EXP += tonumber(result.expReward) or 0
+				local extra = result.ExtraReward
+				if type(extra) == "table" then
+					for k, v in pairs(extra) do
+						local n = tonumber(v)
+						if n then
+							local key = tostring(k)
+							TOTAL_EXTRA[key] = (TOTAL_EXTRA[key] or 0) + n
+						end
+					end
 				end
-				copy.at = os.date("!%Y-%m-%d %H:%M:%S UTC")
-				LAST_RESULT = copy
 			end
 			onMatchEnd(result, "GlobalInit/Gameover")
 		end)
@@ -4209,6 +4325,7 @@ Library:OnUnload(function()
 	persistUI() -- one last snapshot on the way out
 	ReExec.clearTarget() -- cancel a queued re-execute on manual unload
 	setAntiAfk(false)
+	setBlackScreen(false) -- never leave rendering disabled after an unload
 	RECORDING = false
 	RecState = "idle"
 	PAUSE_AT = nil
