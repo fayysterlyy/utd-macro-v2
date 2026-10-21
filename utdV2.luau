@@ -738,6 +738,9 @@ local RECORD_WHITELIST = {
 	PlayerSelectPhantomPath = true,
 	PlayerActivateTowerAbility = true,
 	PlayerToggleAutoAbility = true,
+	-- settings toggles (e.g. "toggleAutoUpgrade", true/false) - plain string +
+	-- bool args, replayed verbatim, no cash/entity handling
+	PlayerSetSetting = true,
 }
 
 local function shouldRecord(remote)
@@ -978,6 +981,46 @@ local function loadMacro(name)
 				if e.entityId2 ~= nil then
 					byEntity[tostring(e.entityId2)] = e
 				end
+			end
+		end
+		-- repair for macros recorded before the id-reply race was fixed: a
+		-- place step whose TowerPlacedSuccessfully reply was missed stays
+		-- without entityId, so every later ability/upgrade step on that tower
+		-- points at an id nothing maps to (the step fired stale and did
+		-- nothing). Ability/upgrade steps only ever reference OUR towers, so
+		-- exactly one unstamped place step + exactly one unknown id means that
+		-- id belongs to it - stamp it now so the replay can remap.
+		local unstamped = {}
+		for _, e in ipairs(data.events) do
+			if e.name == "PlayerPlaceTower" and e.entityId == nil then
+				unstamped[#unstamped + 1] = e
+			end
+		end
+		if #unstamped == 1 then
+			local unknown = {}
+			-- the place rec is the earliest tower placed while recording, so a
+			-- step that predates it cannot belong to it (it would have to
+			-- reference a tower that already existed before the recording
+			-- started) - skip those instead of guessing.
+			local recAt = tonumber(unstamped[1].t) or 0
+			for _, e in ipairs(data.events) do
+				if ENTITY_REMOTES[e.name] and (tonumber(e.t) or 0) >= recAt - 0.001 then
+					local a1 = argAt(e.args, 1)
+					if type(a1) == "string" or type(a1) == "number" then
+						local id = tostring(a1)
+						if not byEntity[id] then
+							unknown[id] = true
+						end
+					end
+				end
+			end
+			local ids = {}
+			for id in pairs(unknown) do
+				ids[#ids + 1] = id
+			end
+			if #ids == 1 then
+				unstamped[1].entityId = ids[1]
+				byEntity[ids[1]] = unstamped[1]
 			end
 		end
 		data.placeByEntity = byEntity
@@ -1329,8 +1372,14 @@ local function startReplay(events, tolerance, placeByEntity)
 						advanceStep(ctx, rec)
 						updateReplayStatus()
 					else
-					-- time arrived: if the step needs cash we don't have yet, hold
+					-- time arrived: if the step needs cash we don't have yet, hold.
+					-- "Wait for Cash" toggle off = skip the gate entirely, fire the
+					-- step right away (the server rejects it if you truly can't
+					-- afford it) - for when a bad recorded cost would false-skip.
 					local need = rec.cost
+					if not (Toggles.CashWaitOn and Toggles.CashWaitOn.Value) then
+						need = nil
+					end
 					if type(need) == "number" and need > 0 then
 						local have = getCash() or 0
 						if have < need then
@@ -2293,42 +2342,6 @@ MiscBox:AddToggle("AntiAfk", {
 	end,
 })
 
--- black screen: kills 3D rendering and covers the whole screen to save GPU.
--- Rendering is restored (and the cover removed) the moment it is toggled off.
-local function setBlackScreen(on)
-	pcall(function()
-		game:GetService("RunService"):Set3dRenderingEnabled(not on)
-	end)
-	local root = (gethui and gethui()) or game:GetService("CoreGui")
-	if on then
-		if not root:FindFirstChild("BS") then
-			local g = Instance.new("ScreenGui")
-			g.Name = "BS"
-			g.IgnoreGuiInset = true
-			g.DisplayOrder = 999999
-			g.Parent = root
-			local f = Instance.new("Frame")
-			f.Size = UDim2.new(1, 0, 1, 0)
-			f.BackgroundColor3 = Color3.new(0, 0, 0)
-			f.BorderSizePixel = 0
-			f.Parent = g
-		end
-	else
-		pcall(function()
-			root.BS:Destroy()
-		end)
-	end
-end
-
-MiscBox:AddToggle("BlackScreen", {
-	Default = false,
-	Text = "Black Screen",
-	Tooltip = "Turns 3D rendering off and blacks out the screen to save GPU. Toggle it back off to restore.",
-	Callback = function(Value)
-		setBlackScreen(Value)
-	end,
-})
-
 local MiscInfoBox = Tabs.Misc:AddRightGroupbox("Info")
 local MiscPlayerLabel = MiscInfoBox:AddLabel("Player: ...", true)
 local MiscWhereLabel = MiscInfoBox:AddLabel("Where: ...", true)
@@ -2371,12 +2384,23 @@ setAntiAfk(Toggles.AntiAfk.Value)
 
 -- rewards accumulated across every finished match this session. The webhook
 -- reports the TOTALS, not just the last match. Fed by the GlobalInit/Gameover
--- channel, which carries the full reward table (and is created once, so the
--- listener keeps working match after match).
-local TOTAL_GOLD = 0
-local TOTAL_EXP = 0
-local TOTAL_EXTRA = {} -- reward name -> summed amount
-local MATCHES_DONE = 0
+-- channel, which carries the full reward table (watchRemote keeps that hook
+-- alive across the lobby/match remote swaps).
+-- The numbers live in getgenv on purpose: the script is re-run by
+-- queue_on_teleport after every teleport (and by live-reload), and plain
+-- locals would zero the report on each of those - the webhook would only ever
+-- show the matches since the last reload.
+-- one shared table = the getgenv() store itself (same reference), so mutating
+-- it persists across reload/teleport with no explicit copy-back. Kept as a
+-- single local to stay under Luau's 200-register top-level limit.
+local Totals = getgenv().__UTD_TOTALS
+if type(Totals) ~= "table" then
+	Totals = { gold = 0, exp = 0, matches = 0, extra = {} }
+	getgenv().__UTD_TOTALS = Totals
+end
+if type(Totals.extra) ~= "table" then
+	Totals.extra = {}
+end
 -- reward names as they should read on Discord
 local EXTRA_NAME = {
 	DungeonToken = "Rubies",
@@ -2451,25 +2475,25 @@ local function sendEarnings(test)
 	local fields = {
 		{ name = "Player", value = who, inline = true },
 		{ name = "Status", value = info.where .. " | " .. info.map .. " | Wave " .. info.wave, inline = true },
-		{ name = "Matches", value = tostring(MATCHES_DONE), inline = true },
+		{ name = "Matches", value = tostring(Totals.matches), inline = true },
 	}
 	local lines
-	if MATCHES_DONE == 0 then
+	if Totals.matches == 0 then
 		lines = { "no match finished yet" }
 	else
 		-- Gold / Rubies / Exp lead; every other extra reward sits below a blank
 		-- line so the main currencies stay easy to read
 		local top = {
-			{ "Gold", formatCash(TOTAL_GOLD) },
+			{ "Gold", formatCash(Totals.gold) },
 		}
-		if TOTAL_EXTRA.DungeonToken then
-			top[#top + 1] = { extraLabel("DungeonToken"), tostring(TOTAL_EXTRA.DungeonToken) }
+		if Totals.extra.DungeonToken then
+			top[#top + 1] = { extraLabel("DungeonToken"), tostring(Totals.extra.DungeonToken) }
 		end
-		top[#top + 1] = { "Exp", tostring(TOTAL_EXP) }
+		top[#top + 1] = { "Exp", tostring(Totals.exp) }
 		-- every other extra reward, alphabetically
 		local rest = {}
 		local keys = {}
-		for k in pairs(TOTAL_EXTRA) do
+		for k in pairs(Totals.extra) do
 			if k ~= "DungeonToken" then
 				keys[#keys + 1] = k
 			end
@@ -2478,7 +2502,7 @@ local function sendEarnings(test)
 			return extraLabel(a) < extraLabel(b)
 		end)
 		for _, k in ipairs(keys) do
-			rest[#rest + 1] = { extraLabel(k), tostring(TOTAL_EXTRA[k]) }
+			rest[#rest + 1] = { extraLabel(k), tostring(Totals.extra[k]) }
 		end
 		-- one shared pad so the arrows line up across BOTH groups
 		local pad = 0
@@ -2829,6 +2853,12 @@ MacroBox:AddSlider("CashWait", {
 	Tooltip = "When a step needs money you don't have yet, hold for this long for cash to arrive. 0 = wait forever.",
 })
 
+MacroBox:AddToggle("CashWaitOn", {
+	Text = "Wait for Cash",
+	Default = true,
+	Tooltip = "ON: if a step costs more than you have, hold up to Max Cash Wait for cash. OFF: never wait - fire every step immediately (a bad recorded cost won't false-skip a tower).",
+})
+
 MacroBox:AddToggle("AutoReplay", {
 	Text = "Auto Replay (on match start)",
 	Default = false,
@@ -3055,60 +3085,96 @@ local function takePlace(queue, typ)
 	end
 	return nil
 end
-task.spawn(function()
-	local tps
-	while not tps and STATE.alive() and myGenAlive() do
-		local RS = game:GetService("ReplicatedStorage")
-		local m = RS:FindFirstChild("Modules")
-		local g = m and m:FindFirstChild("GlobalInit")
-		local re = g and g:FindFirstChild("RemoteEvents")
-		tps = re and re:FindFirstChild("TowerPlacedSuccessfully")
-		if not tps then
+--// Dynamic remote watcher. TowerPlacedSuccessfully and the GlobalInit remotes
+-- are created and destroyed by the game as it moves between lobby and match, so
+-- a one-shot attach either misses the first event (the old 1s poll lost the very
+-- first placement's id reply, leaving that tower without entityId - and an
+-- ability/upgrade step on it could never be remapped) or dies silently later and
+-- the rewards totals stop accumulating. This keeps a live hook instead:
+--   * ChildAdded catches a fresh remote the moment it exists - no poll race for
+--     the first event of a match,
+--   * a slow poll is the fallback for loading between states (folder missing),
+--   * a weak "already hooked" set turns a re-parent of the SAME instance into a
+--     no-op instead of a second connection firing the handler twice,
+--   * every instance is hooked at most once, so totals can never double-count.
+local function watchRemote(getFolder, remoteName, handler, onHook)
+	local hooked = setmetatable({}, { __mode = "k" })
+	local connFolder
+	local function hook(remote)
+		if not remote or hooked[remote] then
+			return
+		end
+		hooked[remote] = true
+		if onHook then
+			pcall(onHook, remote)
+		end
+		STATE.connect(remote.OnClientEvent, handler)
+	end
+	while STATE.alive() and myGenAlive() do
+		local folder = getFolder()
+		if folder then
+			if folder ~= connFolder then
+				connFolder = folder
+				STATE.connect(folder.ChildAdded, function(child)
+					if child.Name == remoteName then
+						hook(child)
+					end
+				end)
+			end
+			hook(folder:FindFirstChild(remoteName))
 			task.wait(1)
+		else
+			task.wait(0.1)
 		end
 	end
-	if tps then
-		STATE.connect(tps.OnClientEvent, function(a1, a2)
-			if not myGenAlive() then
-				return
-			end
-			local eid = a1 ~= nil and tostring(a1) or nil
-			if not eid then
-				return
-			end
-			local typ = a2 ~= nil and tostring(a2) or nil
-			local function fallbackShift(queue)
-				if #queue == 0 then
-					return nil
-				end
-				tpsMissStreak += 1
-				if tpsMissStreak >= 3 then
-					tpsMissStreak = 0
-					warn("[UTD] tower id/type mismatch 3x - order fallback")
-					return table.remove(queue, 1)
-				end
+end
+
+task.spawn(function()
+	local function onTps(a1, a2)
+		if not myGenAlive() then
+			return
+		end
+		local eid = a1 ~= nil and tostring(a1) or nil
+		if not eid then
+			return
+		end
+		local typ = a2 ~= nil and tostring(a2) or nil
+		local function fallbackShift(queue)
+			if #queue == 0 then
 				return nil
 			end
-			if RECORDING and #PlaceQueue > 0 then
-				local rec = takePlace(PlaceQueue, typ) or fallbackShift(PlaceQueue)
-				if rec then
-					rec.entityId = eid
-					if a2 ~= nil then
-						rec.entityId2 = tostring(a2)
-					end
+			tpsMissStreak += 1
+			if tpsMissStreak >= 3 then
+				tpsMissStreak = 0
+				warn("[UTD] tower id/type mismatch 3x - order fallback")
+				return table.remove(queue, 1)
+			end
+			return nil
+		end
+		if RECORDING and #PlaceQueue > 0 then
+			local rec = takePlace(PlaceQueue, typ) or fallbackShift(PlaceQueue)
+			if rec then
+				rec.entityId = eid
+				if a2 ~= nil then
+					rec.entityId2 = tostring(a2)
 				end
 			end
-			local ctx = ReplayCtx
-			if ctx and ctx.placeQueue and #ctx.placeQueue > 0 then
-				local rec = takePlace(ctx.placeQueue, typ) or fallbackShift(ctx.placeQueue)
-				if rec then
-					ctx.newIdByRec[rec] = eid
-				end
+		end
+		local ctx = ReplayCtx
+		if ctx and ctx.placeQueue and #ctx.placeQueue > 0 then
+			local rec = takePlace(ctx.placeQueue, typ) or fallbackShift(ctx.placeQueue)
+			if rec then
+				ctx.newIdByRec[rec] = eid
 			end
-		end)
-	else
-		warn("[UTD] TowerPlacedSuccessfully remote not found")
+		end
 	end
+	watchRemote(function()
+	local m = game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+	local g = m and m:FindFirstChild("GlobalInit")
+	return g and g:FindFirstChild("RemoteEvents")
+end, "TowerPlacedSuccessfully", onTps, function()
+		tpsMissStreak = 0 -- a fresh instance is a fresh match context
+	end)
 end)
 
 --// Auto replay trigger: server fires MatchBegun(mapName) when the match starts
@@ -3139,6 +3205,10 @@ local backFrom10Run = 0
 local autoNextRun = 0
 local autoPlaceRun = 0
 local challengeRun = 0
+-- last time ANY challenge vote went out; the screen fallback uses this to
+-- stand down while the primary (authoritative, correct) remote path is live,
+-- so a scrambled screen title->id guess can never override a good pick.
+local lastChallengeVoteAt = 0
 
 -- Auto Back from 10: armed only for a "Forsaken Prison - Floor 10" match
 local backFrom10Armed = false
@@ -3387,15 +3457,18 @@ local dungLastScreenSig = nil
 local dungLastUnknownSig = nil
 local dungLastUnreadable = nil
 
--- Challenge vote sender: fires the pick 4 times, 1s apart, re-resolving the
--- remote every time. If the first shot is dropped the rest cover it; repeat
--- votes for the same slot are harmless.
+-- Challenge vote sender: fires the pick ONCE, then waits for the server's
+-- "Challenge Selected" confirmation (the ServerSendMessage listener below bumps
+-- challengeRun when it lands) and only re-fires if nothing came back. Max 2
+-- shots - no blind x4 spam; repeat votes for the same slot were harmless but
+-- just noise.
 local function fireChallengeVote(pick, tag)
 	local myRun = challengeRun
+	lastChallengeVoteAt = os.clock()
 	task.spawn(function()
-		for i = 1, 4 do
+		for i = 1, 2 do
 			if myRun ~= challengeRun then
-				break
+				break -- server confirmed the pick (listener bumped challengeRun)
 			end
 			if not (Toggles.AutoBestChallenge and Toggles.AutoBestChallenge.Value) then
 				break
@@ -3404,10 +3477,10 @@ local function fireChallengeVote(pick, tag)
 				break
 			end
 			if i > 1 then
-				task.wait(1)
+				task.wait(1.5)
 			end
 			if myRun ~= challengeRun then
-				break
+				break -- confirmed while waiting: skip the retry
 			end
 			if not (Toggles.AutoBestChallenge and Toggles.AutoBestChallenge.Value) then
 				break
@@ -3416,8 +3489,8 @@ local function fireChallengeVote(pick, tag)
 				warn("[UTD] PlayerVoteForChallenge not found")
 				break
 			end
+			print("[UTD] challenge vote shot " .. i .. " sent: " .. tostring(pick) .. " (" .. tostring(tag) .. ")")
 		end
-		print("[UTD] challenge vote x4 sent: " .. tostring(pick) .. " (" .. tostring(tag) .. ")")
 	end)
 end
 
@@ -3479,16 +3552,12 @@ local function readChallengeTitles()
 end
 
 local function learnChallengeTitles(ids)
-	local titles = readChallengeTitles()
-	if not titles or #titles ~= #ids then
-		return
-	end
-	for i, title in ipairs(titles) do
-		if ids[i] and dungTitleMap[title] ~= ids[i] then
-			dungTitleMap[title] = ids[i]
-			print("[UTD] learned challenge: '" .. title .. "' = " .. tostring(ids[i]))
-		end
-	end
+	-- LEARNING DISABLED: the server already sends the exact internal names on
+	-- ServerStartChallengeVote (they ARE the CHALLENGE_RANK keys), and title->
+	-- id pairs learned from on-screen cards came out scrambled ("No Selling" =
+	-- SlowImmunity), which then beat the correct fuzzy match. The screen
+	-- fallback now resolves titles purely by fuzzy matching.
+	return
 end
 
 -- fuzzy title -> id for unlearned cards: stem both sides the same way and
@@ -3530,6 +3599,34 @@ local function fuzzyChallengeId(title)
 		return best
 	end
 	return nil
+end
+
+-- resolve a card title to its internal id: exact table first, fuzzy fallback.
+-- Everything else lives inside this do-block so only resolveChallengeId counts
+-- as a top-level local (register budget is tight at ~200).
+local resolveChallengeId
+do
+	-- normalize (lowercase, strip non-alphanumerics) so spacing/case never
+	-- matters when matching a card title to its id
+	local function normTitle(t)
+		return (tostring(t):lower():gsub("[^%w]", ""))
+	end
+	-- "normalizedTitle=InternalId" pairs in ONE string, parsed once at load.
+	local RAW = "bleedingimmunity=BleedingImmunity,bleedimmunity=BleedingImmunity,burnimmunity=BurningImmunity,burningimmunity=BurningImmunity,poisonimmunity=PoisonImmunity,timestopimmunity=TimestopImmunity,slowimmunity=SlowImmunity,doublebossespawns=DoubleBosses,doublebossespawn=DoubleBosses,doublebosses=DoubleBosses,healingenemies=Healer,healer=Healer,norefunds=NoRefunds,tankenemies=Tank,tank=Tank,enemyhealth=EnemyHealth,toughenemies=EnemyHealth,enemyspeed=EnemySpeed,fastenemies=EnemySpeed,enemyspawncount=EnemySpawnCount,moreenemies=EnemySpawnCount,towerdamage=TowerDamage,weakenedtowers=TowerDamage,towerdegrading=TowerDegrading,degradingtowers=TowerDegrading,towerrange=TowerRange,reducedrange=TowerRange,explosiveenemies=Explosive,explosive=Explosive,noselling=NoSelling,shieldhealth=ShieldHealth,shieldedenemies=Shielded,armoredenemies=Shielded,shielded=Shielded,uselessartifacts=UselessArtifacts,uselessfarms=UselessFarms,farmsgive50cash=UselessFarms,singleplacementtowers=SinglePlacement,singleplacement=SinglePlacement,uselesstraits=UselessTraits,elementalenemies=ElementalShield,elementalshield=ElementalShield,stealthenemies=Stealth,stealth=Stealth,doubletowercosts=DoubleTowerCosts,doubletowercost=DoubleTowerCosts"
+	local map = {}
+	for pair in RAW:gmatch("[^,]+") do
+		local key, val = pair:match("^([^=]+)=(.+)$")
+		if key and val then
+			map[key] = val
+		end
+	end
+	function resolveChallengeId(title)
+		local id = map[normTitle(title)]
+		if id then
+			return id
+		end
+		return fuzzyChallengeId(title)
+	end
 end
 
 --// Auto Dungeon toggles
@@ -3646,18 +3743,11 @@ task.spawn(function()
 				dungLastUnreadable = nil
 				local sig = table.concat(titles, "|")
 				if sig ~= dungLastScreenSig then
-					-- resolve all three: learned pairs first, fuzzy match
+					-- resolve all three: hand-mapped table first, fuzzy match
 					-- (unique best only) as backup
 					local ids, okAll = {}, true
 					for _, title in ipairs(titles) do
-						local id = dungTitleMap[title]
-						if not id then
-							id = fuzzyChallengeId(title)
-							if id then
-								dungTitleMap[title] = id
-								print("[UTD] screen vote: fuzzy '" .. title .. "' = " .. id)
-							end
-						end
+						local id = resolveChallengeId(title)
 						if not id then
 							okAll = false
 							if sig ~= dungLastUnknownSig then
@@ -3677,9 +3767,16 @@ task.spawn(function()
 							end
 						end
 						dungLastScreenSig = sig
-						print("[UTD] screen vote: " .. table.concat(titles, ", ") .. " -> picking " .. pick)
-						setChallengeLabel("picked " .. pick .. " (" .. ids[pick] .. ") [screen]")
-						fireChallengeVote(pick, ids[pick] .. " screen")
+						-- stand down while the primary (authoritative) path is
+						-- live: if it voted in the last few seconds its pick is
+						-- correct and this screen guess must not override it.
+						if os.clock() - lastChallengeVoteAt < 3 then
+							print("[UTD] screen vote suppressed (primary just voted)")
+						else
+							print("[UTD] screen vote: " .. table.concat(titles, ", ") .. " -> picking " .. pick)
+							setChallengeLabel("picked " .. pick .. " (" .. ids[pick] .. ") [screen]")
+							fireChallengeVote(pick, ids[pick] .. " screen")
+						end
 					end
 				end
 			end
@@ -3729,6 +3826,43 @@ task.spawn(function()
 			end)
 		end
 		task.wait(1) -- re-check fast: the remote appears only at match start
+	end
+end)
+
+--// Challenge confirmation: the server broadcasts "Challenge Selected: <font>NAME</font>"
+-- on ServerSendMessage once a pick is locked in. Catch it, bump challengeRun so
+-- any in-flight fireChallengeVote retry stops (no extra votes), and log the
+-- resolved title so we can see (and verify) which challenge actually won.
+task.spawn(function()
+	local connected
+	while STATE.alive() and myGenAlive() do
+		local re = resolvePath("ReplicatedStorage.Modules.GlobalInit.RemoteEvents")
+		local send = re and re:FindFirstChild("ServerSendMessage")
+		if send and send ~= connected then
+			connected = send
+			STATE.connect(send.OnClientEvent, function(...)
+				if not myGenAlive() then
+					return
+				end
+				for _, a in ipairs({ ... }) do
+					local s = tostring(a)
+					if s:find("Challenge Selected", 1, true) then
+						-- strip RichText tags ("<font ...>" / "</font>") first
+						local clean = s:gsub("<[^>]+>", "")
+						local title = clean:match("Challenge Selected:%s*(.+)")
+						if title then
+							title = title:gsub("^%s+", ""):gsub("%s+$", "")
+							local id = resolveChallengeId(title)
+							challengeRun += 1 -- stop any pending retry (vote landed)
+							print("[UTD] challenge confirmed: '" .. title .. "'"
+								.. (id and (" = " .. id .. " (rank " .. tostring(CHALLENGE_RANK[id] or "?") .. ")") or " (unresolved)"))
+							setChallengeLabel("confirmed: " .. title)
+						end
+					end
+				end
+			end)
+		end
+		task.wait(1)
 	end
 end)
 
@@ -4155,42 +4289,40 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-	local GameoverRemote
-	while not GameoverRemote and STATE.alive() and myGenAlive() do
-		local RS = game:GetService("ReplicatedStorage")
-		local m = RS:FindFirstChild("Modules")
-		local g = m and m:FindFirstChild("GlobalInit")
-		local re = g and g:FindFirstChild("RemoteEvents")
-		GameoverRemote = re and re:FindFirstChild("Gameover")
-		if not GameoverRemote then
-			task.wait(1)
+	-- This channel carries the full reward table (goldReward, expReward,
+	-- ExtraReward); Network/Gameover only carries a victory flag. The GlobalInit
+	-- remotes are rebuilt by the game between lobby and match, so a one-shot
+	-- attach dies silently and the totals stop accumulating - watchRemote keeps
+	-- the hook alive (and its once-per-instance rule keeps a reward event from
+	-- ever being counted twice).
+	local function onGameover(result)
+		if not myGenAlive() then
+			return
 		end
-	end
-	if GameoverRemote then
-		STATE.connect(GameoverRemote.OnClientEvent, function(result)
-			-- this channel carries the full reward table (goldReward, expReward,
-			-- ExtraReward). Fold it into the running totals the webhook reports.
-			-- The Network/Gameover channel only carries a victory flag.
-			if type(result) == "table" then
-				MATCHES_DONE += 1
-				TOTAL_GOLD += tonumber(result.goldReward) or 0
-				TOTAL_EXP += tonumber(result.expReward) or 0
-				local extra = result.ExtraReward
-				if type(extra) == "table" then
-					for k, v in pairs(extra) do
-						local n = tonumber(v)
-						if n then
-							local key = tostring(k)
-							TOTAL_EXTRA[key] = (TOTAL_EXTRA[key] or 0) + n
-						end
+		-- fold it into the running totals the webhook reports (Totals IS the
+		-- getgenv() store, so these writes persist on their own)
+		if type(result) == "table" then
+			Totals.matches += 1
+			Totals.gold += tonumber(result.goldReward) or 0
+			Totals.exp += tonumber(result.expReward) or 0
+			local extra = result.ExtraReward
+			if type(extra) == "table" then
+				for k, v in pairs(extra) do
+					local n = tonumber(v)
+					if n then
+						local key = tostring(k)
+						Totals.extra[key] = (Totals.extra[key] or 0) + n
 					end
 				end
 			end
-			onMatchEnd(result, "GlobalInit/Gameover")
-		end)
-	else
-		warn("[UTD] GlobalInit/Gameover remote not found")
+		end
+		onMatchEnd(result, "GlobalInit/Gameover")
 	end
+	watchRemote(function()
+	local m = game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+	local g = m and m:FindFirstChild("GlobalInit")
+	return g and g:FindFirstChild("RemoteEvents")
+end, "Gameover", onGameover)
 end)
 
 
@@ -4325,7 +4457,6 @@ Library:OnUnload(function()
 	persistUI() -- one last snapshot on the way out
 	ReExec.clearTarget() -- cancel a queued re-execute on manual unload
 	setAntiAfk(false)
-	setBlackScreen(false) -- never leave rendering disabled after an unload
 	RECORDING = false
 	RecState = "idle"
 	PAUSE_AT = nil
