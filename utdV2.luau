@@ -742,28 +742,32 @@ end
 
 --// Recording filter: tower actions only, PlayerReadyForNextWave excluded
 -- (the game auto-skips waves by default anyway)
+-- value = true: always capture | value = "SomeToggle": capture only while
+-- that Record* toggle is on. Place is the backbone of every macro, so it
+-- is always kept.
 local RECORD_WHITELIST = {
 	PlayerPlaceTower = true,
-	PlayerUpgradeTower = true,
-	PlayerSellTower = true,
-	PlayerSetTowerTargetMode = true,
+	PlayerUpgradeTower = "RecordUpgrades",
+	PlayerSellTower = "RecordSells",
+	PlayerSetTowerTargetMode = "RecordTarget",
+	PlayerActivateTowerAbility = "RecordAbility",
+	PlayerToggleAutoAbility = "RecordAbility",
 	PlayerCancelPhantomTower = true,
 	PlayerMovePhantomTower = true,
 	PlayerSelectPhantomPath = true,
-	PlayerActivateTowerAbility = true,
-	PlayerToggleAutoAbility = true,
 	-- settings toggles (e.g. "toggleAutoUpgrade", true/false) - plain string +
 	-- bool args, replayed verbatim, no cash/entity handling
 	PlayerSetSetting = true,
 }
 
 local function shouldRecord(remote)
-	if not RECORD_WHITELIST[remote.Name] then
+	local gate = RECORD_WHITELIST[remote.Name]
+	if not gate then
 		return false
 	end
-	-- Record Upgrades toggle: when off, never capture upgrade actions
-	if remote.Name == "PlayerUpgradeTower" then
-		if not (Toggles.RecordUpgrades and Toggles.RecordUpgrades.Value) then
+	if gate ~= true then
+		local t = Toggles[gate]
+		if not (t and t.Value) then
 			return false
 		end
 	end
@@ -1931,12 +1935,12 @@ AutofishBox:AddToggle("Autofish", {
 
 --// Auto Banner tab
 -- banner ids follow the game's own pattern: Gold<Amateur|Intermediate|...|Experienced>Banner
+-- MAINTENANCE: the summon loop was buggy, so it is parked - the button only
+-- announces maintenance (the old pull loop lives in git history)
 local BANNER_TIERS = { "Amateur", "Intermediate", "Advanced", "Experienced" }
-local bannerRun = 0
-local bannerBusy = false
 
 local BannerBox = Tabs["Auto Banner"]:AddLeftGroupbox("Banner")
-BannerBox:AddLabel("Coming soon", true)
+BannerBox:AddLabel("Maintenance - bakımda", true)
 
 BannerBox:AddDropdown("BannerTier", {
 	Values = BANNER_TIERS,
@@ -1959,38 +1963,7 @@ BannerBox:AddDropdown("BannerCount", {
 BannerBox:AddButton({
 	Text = "Summon",
 	Func = function()
-		if bannerBusy then
-			notify("Banner", "Already summoning - wait for it to finish", 3)
-			return
-		end
-		local tier = Options.BannerTier.Value or "Amateur"
-		local amount = tonumber(Options.BannerAmount.Value) or 1
-		local count = tonumber(Options.BannerCount.Value) or 1
-		bannerRun += 1
-		local id = bannerRun
-		bannerBusy = true
-		task.spawn(function()
-			local pull = classicRemote("PlayerRequestBannerPull")
-			if not pull then
-				notify("Banner", "PlayerRequestBannerPull not found", 5)
-				bannerBusy = false
-				return
-			end
-			local bannerId = "Gold" .. tier .. "Banner"
-			for i = 1, count do
-				if id ~= bannerRun or not STATE.alive() or not myGenAlive() then
-					break
-				end
-				pcall(function()
-					pull:FireServer(bannerId, amount)
-				end)
-				if i < count then
-					task.wait(1)
-				end
-			end
-			bannerBusy = false
-			notify("Banner", "Done", 3)
-		end)
+		notify("Banner", "Auto Banner bakımda (maintenance)", 3)
 	end,
 })
 
@@ -2006,6 +1979,24 @@ RecordBox:AddToggle("RecordUpgrades", {
 	Default = true,
 	Text = "Record Upgrades",
 	Tooltip = "When off, tower upgrades are not captured.",
+})
+
+RecordBox:AddToggle("RecordSells", {
+	Default = true,
+	Text = "Record Sells",
+	Tooltip = "When off, tower sells are not captured.",
+})
+
+RecordBox:AddToggle("RecordTarget", {
+	Default = true,
+	Text = "Record Target",
+	Tooltip = "When off, target mode changes are not captured.",
+})
+
+RecordBox:AddToggle("RecordAbility", {
+	Default = true,
+	Text = "Record Ability",
+	Tooltip = "When off, ability activations are not captured.",
 })
 
 -- cash-moving automations pollute the cash log, so a capture stops them
