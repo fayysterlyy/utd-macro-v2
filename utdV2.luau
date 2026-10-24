@@ -16,6 +16,22 @@ local patchedSrc, patchedN = libSrc:gsub(
 if patchedN == 0 then
 	warn("[UTD] cursor patch missed - Custom Cursor toggle will do nothing")
 end
+-- Linoria's tab columns are a FIXED 509px tall (sized for the stock 600px
+-- window), so a taller window would just leave a dead band under the
+-- content. LeftSide and RightSide both carry this exact size line; stretch
+-- their Y so the columns fill the window instead. Expected count is exactly
+-- 2 (the two sides) - if upstream ever rewords it, leave the source
+-- untouched (the only cost is that cosmetic empty band) and warn.
+local sidesSrc, sidesN = patchedSrc:gsub(
+	"Size = UDim2%.new%(0%.5, %-12 %+ 2, 0, 507 %+ 2%);",
+	"Size = UDim2.new(0.5, -12 + 2, 1, -14);",
+	2
+)
+if sidesN ~= 2 then
+	warn("[UTD] tab-column height patch missed (" .. sidesN .. "/2) - tall window will show empty space at the bottom")
+else
+	patchedSrc = sidesSrc
+end
 local Library = loadstring(patchedSrc)()
 Library.ShowCustomCursor = false
 local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
@@ -292,7 +308,7 @@ local function updateRecordLabel(extra)
 	local mapText = (RECORD_MAP and RECORD_MAP ~= "") and tostring(RECORD_MAP) or "?"
 	local line
 	if RecState == "recording" then
-		line = string.format("â— CAPTURING: %d events, T+%.1fs", #RECORDS, recDuration())
+		line = string.format("> CAPTURING: %d events, T+%.1fs", #RECORDS, recDuration())
 		line ..= "\nMap: " .. mapText
 		if extra then
 			line ..= extra
@@ -300,23 +316,23 @@ local function updateRecordLabel(extra)
 			line ..= lastExtra
 		end
 	elseif RecState == "paused" then
-		line = string.format("âšâš PAUSED at %d events, T+%.1fs", #RECORDS, recDuration())
+		line = string.format("|| PAUSED at %d events, T+%.1fs", #RECORDS, recDuration())
 		line ..= "\nMap: " .. mapText
 		if lastExtra then
 			line ..= "\nLast:" .. lastExtra
 		end
 		line ..= "\nStart = continue, Finish = end"
 	elseif RecState == "armed" then
-		line = "â— WAITING: match has not started yet"
+		line = "... WAITING: match has not started yet"
 		line ..= "\nMap: captured when the match begins"
-		line ..= "\nâ—‹ Capture begins at match start (t=0)"
+		line ..= "\n- Capture begins at match start (t=0)"
 		line ..= "\nRecord = cancel"
 	elseif RecState == "finished" then
-		line = string.format("â–  FINISHED: %d events, T+%.1fs", #RECORDS, recDuration())
+		line = string.format("* FINISHED: %d events, T+%.1fs", #RECORDS, recDuration())
 		line ..= "\nMap: " .. mapText
 		line ..= "\nSave Macro to keep it, Record to start over"
 	else
-		line = "â—‹ IDLE: press Record"
+		line = "- IDLE: press Record"
 		line ..= "\nNext: wait for match, then capture"
 	end
 	pcall(function()
@@ -1092,7 +1108,7 @@ local function updateReplayStatus()
 		end
 		pcall(function()
 			ReplayStatusLabel:SetText(string.format(
-				"%s  %d/%d  Â·  Cash %s",
+				"%s  %d/%d  -  Cash %s",
 				head,
 				done,
 				#ctx.events,
@@ -1501,8 +1517,12 @@ local Window = Library:CreateWindow({
 	Center = true,
 	AutoShow = true,
 	-- 7 sekme varsayilan 550px'e sigmiyordu ("UI Settings" tasiyordu);
-	-- 780px ile tab bar + %50/%50 icerik kolonlari rahat oturuyor.
-	Size = UDim2.fromOffset(780, 600),
+	-- 780px tab barin saginda ~100px olu bosluk birakiyordu. 700px'de
+	-- sekme satiri (~666'lik alana) tam oturur; yukseklik genislikten
+	-- buyuk tutuldu (740 > 700) ki pencere basik gorunmesin - kolonlar
+	-- Library patch'iyle (sides -> 1,-14) yuksekligi pencereye gore
+	-- olceklendigi icin extra yukseklik bosluk degil, icerik alani olur.
+	Size = UDim2.fromOffset(700, 740),
 })
 -- next reload destroys this window instead of orphaning it
 STATE.onCleanup(function()
