@@ -1489,10 +1489,39 @@ pcall(function()
 	end
 end)
 
+-- // PREMIUM SCHEME // CreateWindow'dan ÖNCE set edilir: registry string'leri
+-- scheme'i dinamik okur, tum pencere (groupbox, toggle, notification dahil)
+-- bu renklerle boyanir. Kullanici UI Settings'te tema secersen ThemeManager
+-- override eder - biz sadece DEFAULT guzellestiriyoruz.
+local Scheme = Library.Scheme
+Scheme.BackgroundColor = Color3.fromRGB(11, 11, 20) -- gece-mor zemin (saf siyah degil)
+Scheme.MainColor = Color3.fromRGB(20, 20, 34)       -- panel/kutu ici
+Scheme.AccentColor = Color3.fromRGB(139, 92, 246)   -- electric violet (toggle/aktif vurgu)
+Scheme.OutlineColor = Color3.fromRGB(38, 34, 63)    -- morumsu ince cerceveler
+Scheme.FontColor = Color3.fromRGB(233, 228, 252)    -- sisli mor-beyaz yazi
+Scheme.DarkColor = Color3.fromRGB(6, 6, 13)
+Scheme.Font = Font.fromEnum(Enum.Font.Gotham)       -- premium sans-serif (mono Code yerine)
+Library.CornerRadius = 8                            -- tum kartlarin kose yumusakligi
+
 local Window = Library:CreateWindow({
 	Title = "UTD Hub V2",
 	Center = true,
 	AutoShow = true,
+	Font = Enum.Font.Gotham, -- title font'u (EnumItem'i library Font.fromEnum'a cevirir)
+	CornerRadius = 8,
+	-- pencere/element akisini yumusatan micro-animasyonlar (default hepsi kapali)
+	Animations = {
+		ToggleWindow = true,
+		TabSwitch = true,
+		Groupbox = true,
+		Dropdown = true,
+		KeyPicker = true,
+	},
+	-- secili tabda accent gosterge + yuvarlak tab butonlari
+	TabButtonsStyle = {
+		CornerRadius = 6,
+		Indicator = true,
+	},
 	-- Obsidian kendi layout'unu kendi yonetir (icerik ScrollingFrame'de,
 	-- sabit yukseklikli kolon yok) - Linoria'daki sides patch'i gereksiz.
 	-- Yatay tercih: genislik > yukseklik (940 > 640); her sutun ~458px
