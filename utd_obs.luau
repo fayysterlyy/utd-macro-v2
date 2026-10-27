@@ -1495,9 +1495,10 @@ local Window = Library:CreateWindow({
 	AutoShow = true,
 	-- Obsidian kendi layout'unu kendi yonetir (icerik ScrollingFrame'de,
 	-- sabit yukseklikli kolon yok) - Linoria'daki sides patch'i gereksiz.
-	-- 7 sekme icin 700px genislik korundu; yukseklik > genislik (740 > 700)
-	-- ki pencere basik gorunmesin; Obsidian min boyutu 480x360 - sigar.
-	Size = UDim2.fromOffset(700, 740),
+	-- Yatay tercih: genislik > yukseklik (940 > 640); her sutun ~458px
+	-- olur, slider/dropdown ferah. Obsidian min 480x360; 1366x768 ekranda
+	-- bile clamp'e girmez (viewport - 64 siniri).
+	Size = UDim2.fromOffset(940, 640),
 })
 -- next reload destroys this window instead of orphaning it
 STATE.onCleanup(function()
@@ -1506,14 +1507,17 @@ STATE.onCleanup(function()
 	end)
 end)
 
+-- Tab ikonlari: Obsidian kurulumda lucide setini kendisi fetch eder
+-- (pcall'li; ikon servisi olmazsa sadece ikonsuz devam eder, tablar bozulmaz).
+-- Adlar lucide kanonik adlaridir (bot/swords/fish/gift/skull/wrench/settings).
 local Tabs = {
-	Automation = Window:AddTab("Automation"),
-	["Auto Match"] = Window:AddTab("Auto Match"),
-	["Auto Fish"] = Window:AddTab("Auto Fish"),
-	["Auto Banner"] = Window:AddTab("Auto Banner"),
-	["Auto Dungeon"] = Window:AddTab("Auto Dungeon"),
-	Misc = Window:AddTab("Misc"),
-	["UI Settings"] = Window:AddTab("UI Settings"),
+	Automation = Window:AddTab("Automation", "bot"),
+	["Auto Match"] = Window:AddTab("Auto Match", "swords"),
+	["Auto Fish"] = Window:AddTab("Auto Fish", "fish"),
+	["Auto Banner"] = Window:AddTab("Auto Banner", "gift"),
+	["Auto Dungeon"] = Window:AddTab("Auto Dungeon", "skull"),
+	Misc = Window:AddTab("Misc", "wrench"),
+	["UI Settings"] = Window:AddTab("UI Settings", "settings"),
 }
 
 --// Auto Match tab
