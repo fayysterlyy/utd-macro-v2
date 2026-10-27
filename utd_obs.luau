@@ -281,7 +281,7 @@ local function updateRecordLabel(extra)
 	local mapText = (RECORD_MAP and RECORD_MAP ~= "") and tostring(RECORD_MAP) or "?"
 	local line
 	if RecState == "recording" then
-		line = string.format("> CAPTURING: %d events, T+%.1fs", #RECORDS, recDuration())
+		line = string.format('<font color="#A78BFA">CAPTURING</font>  |  %d events  |  %.1fs', #RECORDS, recDuration())
 		line ..= "\nMap: " .. mapText
 		if extra then
 			line ..= extra
@@ -289,23 +289,23 @@ local function updateRecordLabel(extra)
 			line ..= lastExtra
 		end
 	elseif RecState == "paused" then
-		line = string.format("|| PAUSED at %d events, T+%.1fs", #RECORDS, recDuration())
+		line = string.format('<font color="#FBBF24">PAUSED</font>  |  %d events  |  %.1fs', #RECORDS, recDuration())
 		line ..= "\nMap: " .. mapText
 		if lastExtra then
 			line ..= "\nLast:" .. lastExtra
 		end
 		line ..= "\nStart = continue, Finish = end"
 	elseif RecState == "armed" then
-		line = "... WAITING: match has not started yet"
+		line = '<font color="#FBBF24">WAITING</font>  |  match has not started yet'
 		line ..= "\nMap: captured when the match begins"
-		line ..= "\n- Capture begins at match start (t=0)"
+		line ..= "\nCapture begins at match start (t=0)"
 		line ..= "\nRecord = cancel"
 	elseif RecState == "finished" then
-		line = string.format("* FINISHED: %d events, T+%.1fs", #RECORDS, recDuration())
+		line = string.format('<font color="#34D399">FINISHED</font>  |  %d events  |  %.1fs', #RECORDS, recDuration())
 		line ..= "\nMap: " .. mapText
 		line ..= "\nSave Macro to keep it, Record to start over"
 	else
-		line = "- IDLE: press Record"
+		line = '<font color="#9CA3AF">IDLE</font>  |  press Record'
 		line ..= "\nNext: wait for match, then capture"
 	end
 	pcall(function()
@@ -1058,7 +1058,7 @@ local function updateReplayStatus()
 	local ctx = ReplayCtx
 	if not ctx then
 		if ReplayStatusLabel then
-			ReplayStatusLabel:SetText("Replay: idle")
+			ReplayStatusLabel:SetText('<font color="#8B5CF6">REPLAY</font>  |  idle')
 		end
 		if ReplayStepLabel then
 			ReplayStepLabel:SetText("")
@@ -1072,20 +1072,20 @@ local function updateReplayStatus()
 		local head
 		local w = ctx.waiting
 		if ctx.paused then
-			head = "Paused"
+			head = '<font color="#FBBF24">PAUSED</font>'
 		elseif w and w.kind == "time" then
-			head = string.format("Waiting for time (%.1fs)", math.max(0, w.left))
+			head = string.format('<font color="#FBBF24">WAITING</font>  |  time  %.1fs', math.max(0, w.left))
 		elseif w and w.kind == "cash" then
-			head = string.format("Waiting for cash (%s short)", formatCash(w.need - w.have))
+			head = string.format('<font color="#FBBF24">WAITING</font>  |  cash  %s short', formatCash(w.need - w.have))
 			if w.left then
-				head ..= string.format("  %.0fs left", math.max(0, w.left))
+				head ..= string.format("  (%.0fs left)", math.max(0, w.left))
 			end
 		else
-			head = "Replaying"
+			head = '<font color="#A78BFA">REPLAYING</font>'
 		end
 		pcall(function()
 			ReplayStatusLabel:SetText(string.format(
-				"%s  %d/%d  -  Cash %s",
+				"%s  |  %d/%d  |  Cash %s",
 				head,
 				done,
 				#ctx.events,
@@ -1094,7 +1094,7 @@ local function updateReplayStatus()
 		end)
 	end
 	if ReplayStepLabel and rec then
-		local line = string.format("Step %d: %s", ctx.i, stepLabel(rec))
+		local line = string.format('<font color="#A78BFA">STEP %d</font>  %s', ctx.i, stepLabel(rec))
 		if rec.cost and rec.cost ~= 0 then
 			if rec.cost > 0 then
 				line ..= string.format("  (-%s)", formatCash(rec.cost))
@@ -1974,10 +1974,10 @@ BannerBox:AddButton({
 --// Automation tab
 local RecordBox = Tabs.Automation:AddLeftGroupbox("Recording")
 
-RecordBox:AddLabel("Capturing: place, upgrade, sell, target mode, move, path, ability", true)
+RecordBox:AddLabel("<b>CAPTURES:</b> place, upgrade, sell, target mode, move, path, ability", true)
 
 -- wrap so the multi line recording status is actually visible
-RecordLabel = RecordBox:AddLabel("Status: idle", true)
+RecordLabel = RecordBox:AddLabel('<font color="#9CA3AF">IDLE</font>  |  press Record', true)
 
 RecordBox:AddToggle("RecordUpgrades", {
 	Default = true,
@@ -2352,7 +2352,7 @@ local MiscJobLabel = MiscInfoBox:AddLabel("JobId: ...", true)
 task.spawn(function()
 	while STATE.alive() do
 		pcall(function()
-			MiscPlayerLabel:SetText("Player: " .. LocalPlayer.Name)
+			MiscPlayerLabel:SetText("<b>Player</b>  |  " .. LocalPlayer.Name)
 		end)
 		pcall(function()
 			local rs = game:GetService("ReplicatedStorage")
@@ -2371,10 +2371,10 @@ task.spawn(function()
 					end
 				end
 			end
-			MiscWhereLabel:SetText("Where: " .. where)
+			MiscWhereLabel:SetText("<b>Where</b>  |  " .. where)
 		end)
 		pcall(function()
-			MiscJobLabel:SetText("JobId: " .. tostring(game.JobId))
+			MiscJobLabel:SetText("<b>JobId</b>  |  " .. tostring(game.JobId))
 		end)
 		task.wait(5)
 	end
@@ -2886,7 +2886,7 @@ MacroBox:AddToggle("StopOnGameover", {
 	Tooltip = "Stops the replay if the match HUD disappears (game over / left match).",
 })
 
-ReplayStatusLabel = MacroBox:AddLabel("Replay: idle", true)
+ReplayStatusLabel = MacroBox:AddLabel('<font color="#8B5CF6">REPLAY</font>  |  idle', true)
 
 ReplayStepLabel = MacroBox:AddLabel("", true)
 
@@ -3221,12 +3221,12 @@ local dungeonLastNamedStart = 0
 local dungeonOnMatchStart
 local dungeonOnMatchEnd
 
-local DungeonChallengeLabel = DungeonChallengeBox:AddLabel("Challenge: idle", true)
+local DungeonChallengeLabel = DungeonChallengeBox:AddLabel('<font color="#9CA3AF">CHALLENGE</font>  |  idle', true)
 
 local function setChallengeLabel(text)
 	if DungeonChallengeLabel then
 		pcall(function()
-			DungeonChallengeLabel:SetText("Challenge: " .. text)
+			DungeonChallengeLabel:SetText('<font color="#8B5CF6">CHALLENGE</font>  |  ' .. text)
 		end)
 	end
 end
