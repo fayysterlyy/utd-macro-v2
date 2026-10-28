@@ -2177,16 +2177,6 @@ RecordBox:AddButton({
 
 updateRecordLabel()
 
--- Toggle mode fires the callback on every press (same behavior as the
--- Linoria build; Obsidian also ships a Press mode - kept off for parity)
-RecordBox:AddLabel("Hotkey"):AddKeyPicker("RecordKey", {
-	Default = "F5",
-	Mode = "Toggle",
-	NoUI = true,
-	Text = "Record / Stop / Start",
-	Callback = toggleRecording,
-})
-
 RecordBox:AddDivider()
 RecordBox:AddInput("MacroName", {
 	Default = "",
@@ -4106,7 +4096,7 @@ local AUTO_FILE = "FallyoUTD/auto.json"
 local persistQueued = false
 
 -- keypicker values have their own shape - never persist or restore those
-local PERSIST_SKIP = { RecordKey = true, MenuKeybind = true }
+local PERSIST_SKIP = { MenuKeybind = true }
 
 local function persistUI()
 	local data = { toggles = {}, options = {}, v = 2 }
